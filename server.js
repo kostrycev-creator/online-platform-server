@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Online Platform</title>
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111322;color:#fff;font-family:Arial,sans-serif;overflow:hidden;touch-action:none}
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+.hidden{display:none!important}
+h1{color:#a994ff;font-size:30px;margin-bottom:10px;text-align:center}
+.subtitle{color:#a5a7c4;margin-bottom:25px;text-align:center}
+input{width:100%;max-width:300px;padding:15px;border:1px solid #393b5b;border-radius:12px;background:#20223a;color:white;font-size:16px;margin:7px;outline:none;text-align:center}
+button{border:0;border-radius:12px;padding:15px 22px;font-size:16px;font-weight:bold;color:white;background:#7659e8;cursor:pointer;touch-action:manipulation}
+button:active{transform:scale(.96)}
+.menu-button{width:100%;max-width:300px;margin:7px}
+.secondary{background:#292b46}
+#status{color:#b9b7d4;margin-top:15px;text-align:center;max-width:320px;line-height:1.4}
+#roomCode{color:#c6b7ff;font-size:28px;letter-spacing:5px;margin:15px}
+#waitingStatus{color:#b9b7d4;text-align:center;max-width:300px;line-height:1.4}
+#game{position:absolute;inset:0;background:#17192c}
+canvas{width:100%;height:100%;display:block}
+.topbar{position:absolute;top:12px;left:12px;right:12px;display:flex;justify-content:space-between;align-items:center;pointer-events:none}
+.topbar div{background:#20223acc;padding:10px 13px;border-radius:10px;font-size:13px}
+#leaveButton{pointer-events:auto;background:#343653;padding:9px 12px;font-size:12px}
+#emotions{position:absolute;bottom:115px;left:50%;transform:translateX(-50%);display:flex;gap:8px}
+.emo{background:#292b46;border:1px solid #454765;padding:9px;font-size:21px;border-radius:12px}
+.controls{position:absolute;bottom:20px;left:20px;right:20px;display:flex;justify-content:space-between;align-items:center}
+.control-group{display:flex;gap:12px}
+.move-btn{width:64px;height:64px;border-radius:50%;background:#343653dd;font-size:25px;padding:0}
+.jump-btn{width:78px;height:78px;border-radius:50%;background:#7659e8;font-size:15px;padding:0}
+</style>
+</head>
+<body>
+<div id="menu" class="screen">
+  <h1>ONLINE PLATFORM</h1>
+  <div class="subtitle">Играй вместе с другом</div>
+  <input id="nickname" maxlength="16" autocomplete="nickname" placeholder="Твой никнейм">
+  <button class="menu-button" id="createBtn">Создать комнату</button>
+  <input id="roomInput" maxlength="6" inputmode="numeric" placeholder="Код комнаты">
+  <button class="menu-button secondary" id="joinBtn">Присоединиться</button>
+  <div id="status"></div>
+</div>
+
+<div id="waiting" class="screen hidden">
+  <h1>Комната создана</h1>
+  <div class="subtitle">Отправь код другу</div>
+  <div id="roomCode">------</div>
+  <div id="waitingStatus">Ожидание второго игрока...</div>
+  <button class="menu-button secondary" id="copyBtn">Копировать код</button>
+  <button class="menu-button secondary" id="backBtn">Назад</button>
+</div>
+
+<div id="game" class="hidden">
+  <canvas id="canvas"></canvas>
+  <div class="topbar">
+    <div id="playerCount">Ожидание игрока</div>
+    <button id="leaveButton">Выйти</button>
+  </div>
+  <div id="emotions">
+    <button class="emo" data-emote="👋">👋</button>
+    <button class="emo" data-emote="😂">😂</button>
+    <button class="emo" data-emote="❤️">❤️</button>
+    <button class="emo" data-emote="😎">😎</button>
+  </div>
+  <div class="controls">
+    <div class="control-group">
+      <button class="move-btn" id="leftButton">◀</button>
+      <button class="move-btn" id="rightButton">▶</button>
+    </div>
+    <button class="jump-btn" id="jumpButton">ПРЫЖОК</button>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+const $ = id => document.getElementById(id);
+const menu=$("menu"), waiting=$("waiting"), game=$("game"), statusText=$("status");
+const canvas=$("canvas"), ctx=canvas.getContext("2d");
+let peer=null, conn=null, roomCode="", isHost=false, connected=false;
+let myNickname="", otherNickname="Игрок 2", gameStarted=false, animationId=0;
+let roomPeerId="";
+let joinTimeout=null, reconnecting=false;
+const player={x:100,y:0,vx:0,vy:0,width:36,height:48,grounded:false,emote:"",emoteUntil:0};
+const other={x:250,y:0,width:36,height:48,emote:"",emoteUntil:0};
+const keys={left:false,right:false};
+let jumpQueued=false,lastStateSend=0;
+const gravity=.65,moveSpeed=4.5,jumpPower=-12;
+
+function showScreen(screen){
+  [menu,waiting,game].forEach(s=>s.classList.add("hidden"));
+  screen.classList.remove("hidden");
+}
+function nickname(){
+  const n=$("nickname").value.trim().slice(0,16);
+  if(!n){statusText.textContent="Сначала введи никнейм.";return null;}
+  return n;
+}
+function randomCode(){return String(Math.floor(100000+Math.random()*900000));}
+function setStatus(message){statusText.textContent=message;}
+function cleanPeer(){
+  clearTimeout(joinTimeout);
+  if(conn){try{conn.close();}catch(e){} conn=null;}
+  if(peer){try{peer.destroy();}catch(e){} peer=null;}
+  connected=false;gameStarted=false;reconnecting=false;
+}
+function createRoom(){
+  if(!window.Peer){setStatus("PeerJS не загрузился. Проверь интернет и обнови страницу.");return;}
+  myNickname=nickname();if(!myNickname)return;
+  cleanPeer();isHost=true;roomCode=randomCode();
+  setStatus("Создаём комнату...");
+  attemptCreateRoom();
+}
+function attemptCreateRoom(){
+  roomPeerId="op-"+roomCode;
+  peer=new Peer(roomPeerId,{debug:1});
+  peer.on("open",id=>{
+    $("roomCode").textContent=roomCode;
+    $("waitingStatus").textContent="Ожидание второго игрока...";
+    showScreen(waiting);
+  });
+  peer.on("connection",incoming=>{
+    if(!isHost||connected||conn){
+      incoming.on("open",()=>{incoming.send({type:"room-full"});setTimeout(()=>incoming.close(),250);});
+      return;
+    }
+    conn=incoming;
+    setupConnection(true);
+  });
+  peer.on("error",err=>{
+    console.error("Peer host error:",err);
+    if(err.type==="unavailable-id"){
+      cleanPeer();roomCode=randomCode();attemptCreateRoom();return;
+    }
+    setStatus("Не удалось создать комнату: "+friendlyError(err));
+  });
+  peer.on("disconnected",()=>{
+    if(peer&&!peer.destroyed&&!reconnecting){reconnecting=true;peer.reconnect();setTimeout(()=>reconnecting=false,1500);}
+  });
+}
+function joinRoom(){
+  if(!window.Peer){setStatus("PeerJS не загрузился. Проверь интернет и обнови страницу.");return;}
+  myNickname=nickname();if(!myNickname)return;
+  roomCode=$("roomInput").value.trim();
+  if(!/^\d{6}$/.test(roomCode)){setStatus("Введи шестизначный код комнаты.");return;}
+  cleanPeer();isHost=false;roomPeerId="op-"+roomCode;
+  setStatus("Подключаемся к комнате "+roomCode+"...");
+  peer=new Peer({debug:1});
+  peer.on("open",()=>{
+    conn=peer.connect(roomPeerId,{reliable:true});
+    setupConnection(false);
+    joinTimeout=setTimeout(()=>{
+      if(!connected){setStatus("Не удалось подключиться. Проверь код и убедись, что создатель комнаты остаётся онлайн.");}
+    },15000);
+  });
+  peer.on("error",err=>{
+    console.error("Peer join error:",err);
+    setStatus("Ошибка подключения: "+friendlyError(err));
+  });
+  peer.on("disconnected",()=>{
+    if(peer&&!peer.destroyed&&!reconnecting){reconnecting=true;peer.reconnect();setTimeout(()=>reconnecting=false,1500);}
+  });
+}
+function setupConnection(hostSide){
+  if(!conn)return;
+  conn.on("open",()=>{
+    console.log("Data connection open",hostSide);
+    if(hostSide){
+      $("waitingStatus").textContent="Игрок подключился. Синхронизация...";
+      // The host waits for the join packet before starting and sending welcome.
+    }else{
+      conn.send({type:"join",nickname:myNickname});
+    }
+  });
+  conn.on("data",data=>handleMessage(data));
+  conn.on("error",err=>{
+    console.error("Data connection error:",err);
+    if(!connected)setStatus("Соединение не удалось установить. Попробуй ещё раз.");
+  });
+  conn.on("close",()=>{
+    connected=false;
+    if(gameStarted)$("playerCount").textContent="Игрок отключился";
+    else $("waitingStatus").textContent="Игрок отключился. Ожидание нового подключения...";
+  });
+}
+function handleMessage(data){
+  if(!data||typeof data!=="object")return;
+  if(data.type==="room-full"){
+    setStatus("Комната уже заполнена.");
+    cleanPeer();showScreen(menu);return;
+  }
+  if(data.type==="join"&&isHost){
+    if(connected)return;
+    otherNickname=String(data.nickname||"Игрок 2").slice(0,16);
+    connected=true;
+    conn.send({type:"welcome",nickname:myNickname,x:player.x,y:player.y});
+    $("waitingStatus").textContent="Игрок "+otherNickname+" подключился!";
+    startGame();
+    return;
+  }
+  if(data.type==="welcome"&&!isHost){
+    if(connected)return;
+    otherNickname=String(data.nickname||"Хост").slice(0,16);
+    other.x=Number(data.x)||250;other.y=Number(data.y)||0;
+    connected=true;clearTimeout(joinTimeout);
+    startGame();return;
+  }
+  if(data.type==="state"){
+    other.x=Number(data.x)||0;other.y=Number(data.y)||0;
+    other.emote=String(data.emote||"");
+    other.emoteUntil=Number(data.emoteUntil)||0;
+  }
+  if(data.type==="emote"){
+    other.emote=String(data.emote||"");
+    other.emoteUntil=Date.now()+1800;
+  }
+}
+function startGame(){
+  if(!connected||gameStarted)return;
+  gameStarted=true;showScreen(game);resizeCanvas();
+  player.x=isHost?Math.min(120,innerWidth*.25):Math.min(innerWidth-90,innerWidth*.7);
+  player.y=groundY()-player.height;
+  other.x=isHost?Math.min(innerWidth-90,innerWidth*.7):Math.min(120,innerWidth*.25);
+  other.y=groundY()-other.height;
+  $("playerCount").textContent="2 / 2 игрока";
+  cancelAnimationFrame(animationId);
+  animationId=requestAnimationFrame(gameLoop);
+}
+function leaveGame(){
+  cleanPeer();keys.left=keys.right=false;jumpQueued=false;
+  showScreen(menu);setStatus("");
+}
+async function copyRoomCode(){
+  try{await navigator.clipboard.writeText(roomCode);$("waitingStatus").textContent="Код скопирован!";}
+  catch(e){$("waitingStatus").textContent="Код комнаты: "+roomCode+" (выделите и скопируйте)";}
+}
+function send(data){if(conn&&conn.open)conn.send(data);}
+function sendEmote(emoji){
+  if(!gameStarted)return;
+  player.emote=emoji;player.emoteUntil=Date.now()+1800;
+  send({type:"emote",emote:emoji});
+}
+function groundY(){return innerHeight-100;}
+function resizeCanvas(){
+  const dpr=Math.min(devicePixelRatio||1,2);
+  canvas.width=Math.floor(innerWidth*dpr);canvas.height=Math.floor(innerHeight*dpr);
+  canvas.style.width=innerWidth+"px";canvas.style.height=innerHeight+"px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener("resize",()=>{if(gameStarted)resizeCanvas();});
+function gameLoop(time){
+  if(!gameStarted||game.classList.contains("hidden"))return;
+  updatePlayer();drawGame();
+  if(time-lastStateSend>50){
+    lastStateSend=time;
+    send({type:"state",x:player.x,y:player.y,emote:player.emote,emoteUntil:player.emoteUntil});
+  }
+  animationId=requestAnimationFrame(gameLoop);
+}
+function updatePlayer(){
+  player.vx=keys.left?-moveSpeed:keys.right?moveSpeed:0;
+  player.x+=player.vx;player.vy+=gravity;player.y+=player.vy;
+  const floor=groundY()-player.height;
+  if(player.y>=floor){player.y=floor;player.vy=0;player.grounded=true;}
+  else player.grounded=false;
+  player.x=Math.max(0,Math.min(innerWidth-player.width,player.x));
+  if(jumpQueued&&player.grounded){player.vy=jumpPower;player.grounded=false;}
+  jumpQueued=false;
+}
+function drawGame(){
+  const w=innerWidth,h=innerHeight;
+  ctx.clearRect(0,0,w,h);
+  const gradient=ctx.createLinearGradient(0,0,0,h);
+  gradient.addColorStop(0,"#202342");gradient.addColorStop(1,"#111322");
+  ctx.fillStyle=gradient;ctx.fillRect(0,0,w,h);
+  ctx.fillStyle="#ffffff33";
+  for(let i=0;i<35;i++){const x=(i*97)%w,y=(i*53)%(h*.6);ctx.beginPath();ctx.arc(x,y,1.5,0,Math.PI*2);ctx.fill();}
+  const floor=groundY();
+  ctx.fillStyle="#6754b7";roundRect(25,floor,w-50,22,10);ctx.fill();
+  ctx.fillStyle="#9581f4";roundRect(25,floor,w-50,7,5);ctx.fill();
+  drawPlayer(player,myNickname,"#9b7cff");
+  drawPlayer(other,otherNickname,"#58c8ff");
+}
+function drawPlayer(p,name,color){
+  const x=p.x,y=p.y;
+  ctx.textAlign="center";ctx.font="bold 13px Arial";ctx.fillStyle="#fff";
+  ctx.fillText(name||"Игрок",x+p.width/2,y-12);
+  if(p.emote&&Date.now()<p.emoteUntil){ctx.font="28px Arial";ctx.fillText(p.emote,x+p.width/2,y-40);}
+  ctx.fillStyle=color;roundRect(x,y,p.width,p.height,10);ctx.fill();
+  ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(x+11,y+15,4,0,Math.PI*2);ctx.arc(x+25,y+15,4,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle="#25233b";ctx.beginPath();ctx.arc(x+12,y+15,2,0,Math.PI*2);ctx.arc(x+24,y+15,2,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle="#343653";roundRect(x+4,y+38,12,10,4);ctx.fill();roundRect(x+20,y+38,12,10,4);ctx.fill();
+}
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.roundRect(x,y,w,h,r);}
+
+window.addEventListener("keydown",e=>{
+  if(["ArrowLeft","ArrowRight","ArrowUp"," "].includes(e.key))e.preventDefault();
+  if(e.key==="ArrowLeft"||e.key.toLowerCase()==="a")keys.left=true;
+  if(e.key==="ArrowRight"||e.key.toLowerCase()==="d")keys.right=true;
+  if(e.key==="ArrowUp"||e.key===" "||e.key.toLowerCase()==="w")jumpQueued=true;
+});
+window.addEventListener("keyup",e=>{
+  if(e.key==="ArrowLeft"||e.key.toLowerCase()==="a")keys.left=false;
+  if(e.key==="ArrowRight"||e.key.toLowerCase()==="d")keys.right=false;
+});
+function bindHold(id,key){
+  const b=$(id);
+  const down=e=>{e.preventDefault();keys[key]=true;};
+  const up=e=>{e.preventDefault();keys[key]=false;};
+  b.addEventListener("pointerdown",down);
+  ["pointerup","pointercancel","pointerleave"].forEach(type=>b.addEventListener(type,up));
+}
+bindHold("leftButton","left");bindHold("rightButton","right");
+$("jumpButton").addEventListener("pointerdown",e=>{e.preventDefault();jumpQueued=true;});
+$("createBtn").addEventListener("click",createRoom);
+$("joinBtn").addEventListener("click",joinRoom);
+$("copyBtn").addEventListener("click",copyRoomCode);
+$("backBtn").addEventListener("click",leaveGame);
+$("leaveButton").addEventListener("click",leaveGame);
+document.querySelectorAll("[data-emote]").forEach(b=>b.addEventListener("click",()=>sendEmote(b.dataset.emote)));
+function friendlyError(err){
+  if(!err)return"неизвестная ошибка";
+  const map={
+    "peer-unavailable":"комната не найдена или хост не в сети",
+    "unavailable-id":"код комнаты уже занят",
+    "network":"проблема с сетью",
+    "server-error":"ошибка сервера соединения",
+    "browser-incompatible":"браузер не поддерживает соединение"
+  };
+  return map[err.type]||err.message||err.type||"неизвестная ошибка";
+}
+})();
+</script>
+</body>
+</html>
